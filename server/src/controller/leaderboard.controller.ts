@@ -31,7 +31,7 @@ const getLeaderboard = (req: Request, res: Response) => {
 
 export async function getLeaderboardTopN(
 	n: number,
-): Promise<{ username: string; value: number }[]> {
+): Promise<{ username: string; value: number; firstTransactionDate?: number; initialInvestment?: number }[]> {
 	// 1. Collate all unique stock symbols from users' positions using Aggregation
 	const symbolsAggregation = await User.aggregate([
 		{ $unwind: "$positions" },
@@ -58,23 +58,93 @@ export async function getLeaderboardTopN(
 	}
 	await fetchStockPricesInBatches();
 
-	// 3. Compute portfolio values for each user using projection
-	const usersWithPositions = await User.find(
-		{},
-		{ username: 1, positions: 1, cash: 1 },
-	);
+	// 3. Compute portfolio values for each user using projection and get first transaction date
+	interface Position {
+		symbol: string;
+		quantity: number;
+	}
 
-	const userValues: { username: string; value: number }[] = [];
-	usersWithPositions.forEach((user) => {
+	interface UserWithPositions {
+		username: string;
+		positions: Position[];
+		cash: number;
+		firstTransactionDate?: number;
+		initialInvestment?: number;
+	}
+
+	const userValues: { username: string; value: number; firstTransactionDate?: number; initialInvestment?: number }[] = [];
+
+	// First get users with their transactions
+	const usersWithTransactions = await User.aggregate([
+		{
+			$project: {
+				username: 1,
+				positions: 1,
+				cash: 1,
+				firstTransactionDate: { 
+					$cond: {
+						if: { $gt: [{ $size: "$positions" }, 0] },
+						then: { $min: "$positions.purchaseDate" },
+						else: "$$REMOVE"
+					}
+				},
+				// Calculate initialInvestment from positions
+				initialInvestment: {
+					$add: [
+						100000,  // Initial cash amount
+						{
+							$reduce: {
+								input: "$positions",
+								initialValue: 0,
+								in: {
+									$add: [
+										"$$value",
+										{ $multiply: ["$$this.purchasePrice", "$$this.quantity"] }
+									]
+								}
+							}
+						}
+					]
+				}
+			}
+		}
+	]);
+
+	// Debug log to check the MongoDB query
+	console.log("MongoDB Query:", JSON.stringify(usersWithTransactions, null, 2));
+
+	// Add more specific debug logs
+	console.log("Debug aggregation results:", usersWithTransactions.map(user => ({
+		username: user.username,
+		positionCount: user.positions?.length || 0,
+		firstTransactionDate: user.firstTransactionDate,
+		hasPositions: user.positions?.length > 0,
+		samplePosition: user.positions?.[0]
+	})));
+
+	usersWithTransactions.forEach((user) => {
 		let totalValue = user.cash;
-		user.positions.forEach((position) => {
+		user.positions.forEach((position: Position) => {
 			const currentPrice = stockPrices[position.symbol];
 			totalValue += currentPrice * position.quantity;
 		});
-		userValues.push({ username: user.username, value: totalValue });
+		
+		const userData = { 
+			username: user.username, 
+			value: totalValue,
+			firstTransactionDate: user.firstTransactionDate,
+			initialInvestment: user.initialInvestment
+		};
+
+		console.log(`User ${user.username} portfolio data:`, {
+			value: totalValue,
+			firstTransactionDate: user.firstTransactionDate ? new Date(user.firstTransactionDate) : 'none'
+		});
+
+		userValues.push(userData);
 	});
 
-	// 5. Sort and pick top N users
+	// Sort by portfolio value
 	userValues.sort((a, b) => b.value - a.value);
 
 	return userValues;
